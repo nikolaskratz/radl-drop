@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="112" fill="#0a6cff"/>
+  <path d="M256 92c-72 0-128 55-128 125 0 92 128 203 128 203s128-111 128-203c0-70-56-125-128-125z" fill="#fff"/>
+  <text x="256" y="268" text-anchor="middle" font-family="-apple-system, Helvetica, Arial, sans-serif" font-weight="800" font-size="150" fill="#0a6cff">P</text>
+</svg>
