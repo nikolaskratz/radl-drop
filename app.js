@@ -8,6 +8,8 @@ const GBFS = 'https://gbfs.nextbike.net/maps/gbfs/v2/nextbike_ml/de';
 const VALHALLA = 'https://valhalla1.openstreetmap.de';
 const OSRM = 'https://routing.openstreetmap.de';
 const PHOTON = 'https://photon.komoot.io';
+const NOMINATIM = 'https://nominatim.openstreetmap.org';
+const NOMINATIM_VIEWBOX = '10.8,48.5,12.2,47.75';
 const STYLE = 'https://tiles.openfreemap.org/styles/positron';
 const MUC = [11.5755, 48.1374];
 const BBOX = '10.8,47.75,12.2,48.5';
@@ -462,16 +464,73 @@ function photonPlace(f) {
   return { lat, lon, label, sub };
 }
 
-async function searchPlaces(q) {
-  const near = state.to ?? state.gps ?? { lat: MUC[1], lon: MUC[0] };
-  const d = await getJSON(`${PHOTON}/api/?q=${encodeURIComponent(q)}&lat=${near.lat}&lon=${near.lon}&limit=7&lang=de&bbox=${BBOX}`, {}, 8000);
-  const seen = new Set();
-  return d.features.map(photonPlace).filter((p) => { const k = `${p.label}|${p.sub}`; if (seen.has(k)) return false; seen.add(k); return true; });
+// Photon is strict about how German street names are split. Rewrite the query the way OSM spells it:
+//   Dachauerstr 163 -> Dachauer Straße 163   (street names from places, "-er", are two words)
+//   Leopold Str 50  -> Leopoldstraße 50       (everything else is one word)
+//   Karlspl / Rosenheimer Pl. -> ...platz
+const L = 'A-Za-zÄÖÜäöüß';
+const END = '(?=[\\s,\\d]|$)';
+function queryVariant(q) {
+  let v = q
+    .replace(new RegExp(`(?<=[${L}])str(?:\\.|a(?:ss|s)e)?${END}`, 'gi'), 'straße')
+    .replace(new RegExp(`(?<=[${L}])pl\\.?${END}`, 'gi'), 'platz')
+    .replace(new RegExp(`(?<![${L}])(str\\.?|stra(?:ss|s)e)${END}`, 'gi'), 'Straße')
+    .replace(new RegExp(`(?<![${L}])pl\\.?${END}`, 'gi'), 'Platz');
+  v = v.replace(new RegExp(`([${L}]{3,}er)(straße|platz|weg|allee|ring|gasse)${END}`, 'gi'),
+    (_, w, s) => `${w} ${s[0].toUpperCase()}${s.slice(1).toLowerCase()}`);
+  v = v.replace(new RegExp(`(?<![-${L}])([${L}]{3,})\\s+(straße|platz|weg|allee|ring|gasse)${END}`, 'gi'),
+    (m, w, s) => (/er$/i.test(w) ? m : w + s.toLowerCase()));
+  return v;
 }
 
+async function photonSearch(q) {
+  const near = state.to ?? state.gps ?? { lat: MUC[1], lon: MUC[0] };
+  const d = await getJSON(`${PHOTON}/api/?q=${encodeURIComponent(q)}&lat=${near.lat}&lon=${near.lon}&limit=7&lang=de&bbox=${BBOX}`, {}, 8000);
+  return d.features.map(photonPlace);
+}
+
+function dedupe(places) {
+  const seen = new Set();
+  return places.filter((p) => { const k = `${p.label}|${p.sub}`; if (seen.has(k)) return false; seen.add(k); return true; });
+}
+
+// Original + respelled query in parallel; places carrying the typed house number go first.
+async function searchPlaces(q) {
+  const variant = queryVariant(q);
+  const queries = variant.toLowerCase() === q.toLowerCase() ? [q] : [q, variant];
+  const settled = await Promise.allSettled(queries.map(photonSearch));
+  if (settled.every((r) => r.status === 'rejected')) throw settled[0].reason;
+  const places = dedupe(settled.flatMap((r) => (r.status === 'fulfilled' ? r.value : [])));
+  const num = q.match(/\b\d+\s?[a-z]?\b/i)?.[0].replace(/\s/g, '').toLowerCase();
+  if (!num) return places.slice(0, 7);
+  const hasNum = (p) => `${p.label} ${p.sub}`.toLowerCase().replace(/(\d)\s+([a-z])\b/g, '$1$2').split(/[\s,]+/).includes(num);
+  return [...places.filter(hasNum), ...places.filter((p) => !hasNum(p))].slice(0, 7);
+}
+
+// Nominatim understands sloppy spellings better, but its policy forbids search-as-you-type:
+// only called on an explicit search (Enter / "Search more thoroughly"), at most once per second.
+let lastNominatim = 0;
+async function nominatimSearch(q) {
+  const wait = lastNominatim + 1100 - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastNominatim = Date.now();
+  const d = await getJSON(`${NOMINATIM}/search?q=${encodeURIComponent(q)}&format=jsonv2&limit=6&countrycodes=de`
+    + `&viewbox=${NOMINATIM_VIEWBOX}&bounded=1&addressdetails=1&accept-language=de`, {}, 10000);
+  return dedupe(d.map((x) => {
+    const a = x.address ?? {};
+    const street = [a.road ?? a.pedestrian ?? a.square, a.house_number].filter(Boolean).join(' ');
+    const label = (x.name && x.name !== a.road ? x.name : street) || x.display_name.split(',')[0];
+    const sub = [label !== street ? street : '', a.suburb ?? a.city_district, a.city ?? a.town ?? a.village]
+      .filter((s) => s && s !== label).join(', ');
+    return { lat: +x.lat, lon: +x.lon, label, sub };
+  }));
+}
+
+// "Dachauerstr." finds "Dachauer Straße (Stiglmaierplatz)": compare without case, spaces and dots.
+const squash = (s) => queryVariant(s).toLowerCase().replace(/ß/g, 'ss').replace(/[^a-z0-9äöü]/g, '');
 function searchStations(q) {
-  const n = q.toLowerCase();
-  return state.stations.filter((s) => s.name.toLowerCase().includes(n)).slice(0, 3)
+  const n = squash(q);
+  return state.stations.filter((s) => squash(s.name).includes(n)).slice(0, 3)
     .map((s) => ({ lat: s.lat, lon: s.lon, label: s.name, sub: `MyRadl station · ${s.bikes} bikes` }));
 }
 
@@ -493,6 +552,7 @@ function renderSuggest(groups) {
 function closeSuggest() { $('suggest').hidden = true; suggestions = []; }
 
 function pick(item) {
+  if (item.more) { searchMore(item.q); return; }
   if (activeInput === 'from') setFrom(item.gps ? null : item);
   else setTo(item);
   document.activeElement?.blur();
@@ -509,13 +569,26 @@ function onInput(which) {
   }
   const seq = ++suggestSeq;
   const stations = searchStations(q);
+  const more = [{ label: 'Search more thoroughly', sub: `“${q}”, or press Enter`, more: true, q }];
   renderSuggest([{ items: gpsItem }, { title: 'Stations', items: stations }]);
   debounce = setTimeout(async () => {
-    try {
-      const places = await searchPlaces(q);
-      if (seq === suggestSeq) renderSuggest([{ items: gpsItem }, { items: places }, { title: 'Stations', items: stations }]);
-    } catch (e) { console.warn('search', e); }
+    let places = [];
+    try { places = await searchPlaces(q); } catch (e) { console.warn('search', e); }
+    if (seq === suggestSeq) {
+      renderSuggest([{ items: gpsItem }, { items: places }, { title: 'Stations', items: stations }, { items: more }]);
+    }
   }, 220);
+}
+
+async function searchMore(q) {
+  const seq = ++suggestSeq;
+  const gpsItem = activeInput === 'from' ? [{ label: 'My location', sub: 'Use GPS', gps: true }] : [];
+  renderSuggest([{ items: [{ label: 'Searching…', sub: `“${q}”`, busy: true }] }]);
+  let places = [];
+  try { places = await nominatimSearch(q); } catch (e) { console.warn('nominatim', e); }
+  if (seq !== suggestSeq) return;
+  renderSuggest([{ items: gpsItem },
+    { items: places.length ? places : [{ label: 'Nothing found', sub: 'Try a nearby street or place name', busy: true }] }]);
 }
 
 for (const which of ['from', 'to']) {
@@ -523,7 +596,13 @@ for (const which of ['from', 'to']) {
   inp.addEventListener('input', () => onInput(which));
   inp.addEventListener('focus', () => { inp.select(); onInput(which); });
   inp.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && suggestions.length) { e.preventDefault(); pick(suggestions.find((s) => !s.gps) ?? suggestions[0]); }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const q = inp.value.trim();
+      const first = suggestions.find((s) => !s.gps && !s.more && !s.busy);
+      if (first) pick(first);
+      else if (q.length >= 2) { clearTimeout(debounce); activeInput = which; searchMore(q); }
+    }
     if (e.key === 'Escape') { closeSuggest(); inp.blur(); }
   });
   inp.addEventListener('blur', () => setTimeout(() => {
@@ -537,7 +616,7 @@ for (const which of ['from', 'to']) {
 $('suggest').addEventListener('pointerdown', (e) => e.preventDefault()); // keep focus, avoid blur race
 $('suggest').addEventListener('click', (e) => {
   const li = e.target.closest('li[data-i]');
-  if (li) pick(suggestions[+li.dataset.i]);
+  if (li && !suggestions[+li.dataset.i].busy) pick(suggestions[+li.dataset.i]);
 });
 
 function loadRecent() {
