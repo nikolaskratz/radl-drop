@@ -1001,9 +1001,9 @@ async function refreshStatus() {
 }
 
 // Keep map controls above the bottom sheet.
-new ResizeObserver(([e]) => {
+new ResizeObserver(([e]) => requestAnimationFrame(() => {
   document.documentElement.style.setProperty('--sheet-h', `${e.target.getBoundingClientRect().height}px`);
-}).observe($('sheet'));
+})).observe($('sheet'));
 
 (async () => {
   try {
