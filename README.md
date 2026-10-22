@@ -7,6 +7,15 @@ Trip planner for MyRadl (MVG/MVV bike share, run by nextbike) in Munich:
 - **On a bike**: the drop-off station with the lowest **ride to station + walk to destination**.
 - Filter **All / Bike / E-bike**: picks only stations with that type, e-bikes ride at 20 km/h instead of 16,
   battery of the best e-bike is shown. Bikes parked outside stations count as pickups too.
+- **Saved places**: Home / Work / favourites as one-tap buttons; the star next to the destination saves it.
+- **Bike still there?** While a pickup is shown, counts refresh every 30 s and on returning to the app;
+  if the chosen bike is gone a banner offers the next best. Stops once you have reached the bike.
+- **Arriving**: within 120 m of the pickup or drop-off the map zooms onto that station's zone
+  (selected zones are drawn bold: green = pick up, blue = park).
+- **Fast start**: the station list + zones are cached on the phone (refreshed every 12 h in the background);
+  a normal launch only waits for the 5 KB of live counts and the phone's last known position.
+  Battery levels and loose bikes fill in afterwards. Slow 4G: first result 2.2 s → 0.9 s.
+- Bump the `?v=` on `app.js` / `style.css` in `index.html` with every deploy (phones cache the old files).
 
 Static site, no build step, no API keys. Everything runs in the browser:
 

@@ -32,6 +32,11 @@ const BIKE_KMH = { bike: 16, ebike: 20 };
 const RECENT_KEY = 'radl-drop.recent';
 const PREFS_KEY = 'radl-drop.prefs';
 const STATUS_TTL_MS = 60000;
+const SAVED_KEY = 'radl-drop.saved';
+const INFO_KEY = 'radl-drop.stations.v1'; // station list + zones, cached on the phone
+const INFO_TTL_MS = 12 * 3600e3;            // refreshed in the background twice a day
+const CHECK_EVERY_MS = 30000;               // re-check the chosen bike while a pickup is shown
+const ARRIVE_M = 120;                       // "you're there" radius around a pickup / drop-off
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -47,6 +52,7 @@ const prefs = loadPrefs();
 const state = {
   stations: [],
   loose: [],         // bikes parked outside any station (rentable)
+  looseById: null,   // key -> loose bike, set once free_bike_status has loaded
   vehicleKind: {},   // GBFS vehicle_type_id -> 'bike' | 'ebike'
   statusAt: 0,
   gps: null,         // {lat, lon} from watchPosition
@@ -59,6 +65,9 @@ const state = {
   ranked: [],        // best first
   sel: 0,
   planSeq: 0,
+  saved: [],         // [{kind: 'home' | 'work' | 'fav', name, lat, lon, label, sub}]
+  savingAs: null,    // 'home' | 'work' while the user picks that address
+  arrival: null,     // {targets, done:Set} for the selected option, see checkArrival()
 };
 
 function savePrefs() {
@@ -277,7 +286,9 @@ async function plan() {
 
   const seq = ++state.planSeq;
   hint(state.mode === 'have' ? 'Finding the fastest drop-off…' : D ? 'Finding the fastest bike and drop-off…' : `Finding the nearest ${typeWord()}…`);
-  if (state.mode === 'need') await refreshStatus(); // bikes move: counts older than a minute get reloaded
+  // Bikes move: counts older than a minute get reloaded (not during start-up, where they are seconds old).
+  if (state.mode === 'need' && state.looseById) await refreshStatus();
+  plannedAt = !state.from && state.gps ? { ...state.gps, rough: !(state.gps.acc < 100) } : null;
   if (seq !== state.planSeq) return;
 
   let res;
@@ -302,9 +313,31 @@ function hint(text, isErr = false) {
   h.classList.toggle('err', isErr);
 }
 
+// Banner above the results: bike taken, arrived at the pickup / drop-off. One at a time; `tag` lets callers clear their own.
+let alertTag = null;
+function showAlert(tag, tone, html) {
+  alertTag = tag;
+  const el = $('alert');
+  el.className = `alert ${tone}`;
+  el.innerHTML = `<div class="alert-body">${html}</div><button class="alert-x" aria-label="Dismiss">×</button>`;
+  el.hidden = false;
+}
+function hideAlert(tag) {
+  if (tag && tag !== alertTag) return;
+  alertTag = null;
+  $('alert').hidden = true;
+}
+$('alert').addEventListener('click', (e) => {
+  if (e.target.closest('.alert-x')) { hideAlert(); return; }
+  if (e.target.closest('[data-act="replan"]')) { hideAlert(); plan(); }
+});
+
 function clearResults() {
   state.ranked = [];
   state.kind = null;
+  state.arrival = null;
+  hideAlert();
+  setZones(null);
   $('results').innerHTML = '';
   $('pager').innerHTML = '';
   setMapCandidates();
@@ -362,7 +395,8 @@ function cardHTML(r, i, S) {
   </li>`;
 }
 
-function renderResults() {
+// keep = re-render in place (fresh bike counts / battery) without resetting the selected card.
+function renderResults(keep = false) {
   const best = state.ranked[0];
   let msg = { pickup: `Nearest ${typeWord()}`, drop: 'Fastest drop-offs', trip: 'Fastest trips' }[state.kind];
   if (state.directWalk && min(state.directWalk.time) <= min(best.total)) {
@@ -373,9 +407,9 @@ function renderResults() {
   }
   hint(msg);
   const S = startPoint();
-  setSheet('peek');
+  if (!keep) setSheet('peek');
   $('results').innerHTML = state.ranked.slice(0, 3).map((r, i) => cardHTML(r, i, S)).join('');
-  scrollToCard(0, false);
+  if (keep) markSelected(state.sel); else scrollToCard(0, false);
   $('replan').hidden = false;
   $('replan').textContent = state.from ? 'Plan from my location' : 'Re-plan from here';
   setMapCandidates();
@@ -388,13 +422,20 @@ function legsOf(r) {
   return [[S, r.p, 'walk'], [r.p, r.s, ride], [r.s, D, 'walk']];
 }
 
-async function select(i, fit = false, fromSwipe = false) {
-  state.sel = i;
+function markSelected(i) {
   document.querySelectorAll('.card').forEach((c) => c.classList.toggle('sel', +c.dataset.i === i));
-  if (!fromSwipe) scrollToCard(i, !fit);
   const n = Math.min(3, state.ranked.length);
   $('pager').innerHTML = n > 1 ? Array.from({ length: n }, (_, k) => `<i${k === i ? ' class="on"' : ''}></i>`).join('') : '';
+}
+
+async function select(i, fit = false, fromSwipe = false) {
+  state.sel = i;
+  markSelected(i);
+  if (!fromSwipe) scrollToCard(i, !fit);
   drawRankMarkers();
+  setZones(state.ranked[i]);
+  startArrivalWatch(state.ranked[i]);
+  hideAlert('bike');
   const legs = legsOf(state.ranked[i]);
   const ends = legs.flatMap(([a, b]) => [a, b]);
   if (fit) fitTo(ends);
@@ -444,10 +485,15 @@ const point = (p, properties) => ({ type: 'Feature', geometry: { type: 'Point', 
 
 mapReady.then(() => {
   document.querySelector('.maplibregl-ctrl-attrib')?.classList.remove('maplibregl-compact-show');
-  for (const id of ['stations', 'areas', 'loose', 'cands', 'route']) map.addSource(id, { type: 'geojson', data: EMPTY });
+  for (const id of ['stations', 'areas', 'loose', 'cands', 'route', 'zones']) map.addSource(id, { type: 'geojson', data: EMPTY });
 
   map.addLayer({ id: 'areas-fill', type: 'fill', source: 'areas', minzoom: 15, paint: { 'fill-color': ACCENT, 'fill-opacity': 0.28 } });
   map.addLayer({ id: 'areas-line', type: 'line', source: 'areas', minzoom: 15, paint: { 'line-color': ACCENT, 'line-width': ['interpolate', ['linear'], ['zoom'], 15, 1.5, 18, 3] } });
+
+  // Zones of the selected option, bolder than the rest: green = pick up here, blue = park here.
+  const zoneColor = ['case', ['==', ['get', 'role'], 'pick'], PICK, ACCENT];
+  map.addLayer({ id: 'zones-fill', type: 'fill', source: 'zones', minzoom: 14, paint: { 'fill-color': zoneColor, 'fill-opacity': 0.4 } });
+  map.addLayer({ id: 'zones-line', type: 'line', source: 'zones', minzoom: 14, paint: { 'line-color': zoneColor, 'line-width': ['interpolate', ['linear'], ['zoom'], 14, 2, 18, 4.5] } });
 
   map.addLayer({ id: 'route-bike-case', type: 'line', source: 'route', filter: ['==', ['get', 'mode'], 'bike'],
     layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#ffffff', 'line-width': 8 } });
@@ -478,6 +524,11 @@ mapReady.then(() => {
     'text-field': ['to-string', ['get', 'bikes']], 'text-font': ['Noto Sans Bold'], 'text-size': ['interpolate', ['linear'], ['zoom'], 14, 11, 16.5, 12, 18, 9], 'text-allow-overlap': true, 'text-ignore-placement': true,
   }, paint: { 'text-color': ['case', ['get', 'empty'], ACCENT, '#ffffff'] } });
 
+  setStationsOnMap();
+  setMapCandidates();
+  setRoute(lastRoute);
+  setZones(lastZonesFor);
+
   for (const l of ['st', 'cand', 'loose']) {
     map.on('click', l, (e) => placePopup(byKey(e.features[0].properties.k), e.lngLat));
     map.on('mouseenter', l, () => { map.getCanvas().style.cursor = 'pointer'; });
@@ -485,8 +536,8 @@ mapReady.then(() => {
   }
 });
 
-// Stations are "s<i>", loose bikes "l<i>" (indexes into state.stations / state.loose).
-const byKey = (k) => (k[0] === 's' ? state.stations[+k.slice(1)] : state.loose[+k.slice(1)]);
+// Stations are "s<index>", loose bikes "l:<bike_id>" (stable across refreshes).
+const byKey = (k) => (k[0] === 's' ? state.stations[+k.slice(1)] : state.looseById.get(k));
 
 function setStationsOnMap() {
   if (!map.getSource('stations') || !state.stations.length) return;
@@ -510,9 +561,30 @@ function setMapCandidates() {
   map.setPaintProperty('st', 'circle-stroke-opacity', feats.length ? 0.3 : 1);
 }
 
+let lastRoute = [], lastZonesFor = null;
 function setRoute(legs) {
+  lastRoute = legs;
   if (!map.getSource('route')) return;
   map.getSource('route').setData(fc(legs.map((l) => ({ type: 'Feature', geometry: { type: 'LineString', coordinates: l.coords }, properties: { mode: l.mode } }))));
+}
+
+function setZones(r) {
+  lastZonesFor = r;
+  if (!map.getSource('zones')) return;
+  const feats = [];
+  if (r?.p?.area) feats.push({ type: 'Feature', geometry: r.p.area, properties: { role: 'pick' } });
+  if (r?.s?.area) feats.push({ type: 'Feature', geometry: r.s.area, properties: { role: 'drop' } });
+  map.getSource('zones').setData(fc(feats));
+}
+
+// Close-up of one station's parking zone (or a loose bike), clear of the panel and the sheet.
+function zoomToZone(p) {
+  const b = new maplibregl.LngLatBounds();
+  const rings = p.area?.type === 'MultiPolygon' ? p.area.coordinates.flat(1) : p.area?.type === 'Polygon' ? p.area.coordinates : [];
+  rings.flat().forEach((c) => b.extend(c));
+  if (b.isEmpty()) b.extend([p.lon, p.lat]);
+  const top = $('panel').getBoundingClientRect().bottom + 40, bottom = $('sheet').getBoundingClientRect().height + 40;
+  map.fitBounds(b, { padding: { top, bottom, left: 60, right: 60 }, maxZoom: 18.5, duration: 900 });
 }
 
 function el(cls, html = '') { const d = document.createElement('div'); d.className = cls; d.innerHTML = html; return d; }
@@ -735,10 +807,95 @@ map.on('dragstart', () => {
   setSheet('peek');
 });
 
+// ---------- saved places ----------
+// Home / Work / favourites as one-tap buttons under the destination field (stored on the phone only).
+
+const HOME_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"><path d="M4 11 12 4.5l8 6.5v9h-5.5v-5.5h-5V20H4z"/></svg>';
+const WORK_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"><rect x="3.5" y="7.5" width="17" height="12" rx="2"/><path d="M9 7.5V5.5h6v2M3.5 12.5h17"/></svg>';
+const STAR_SVG = '<svg viewBox="0 0 24 24" width="15" height="15"><path d="m12 3.5 2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z" fill="currentColor"/></svg>';
+
+function loadSaved() {
+  try { const s = JSON.parse(localStorage.getItem(SAVED_KEY)); return Array.isArray(s) ? s : []; } catch { return []; }
+}
+function storeSaved() {
+  try { localStorage.setItem(SAVED_KEY, JSON.stringify(state.saved)); } catch { /* private mode: kept for this visit only */ }
+}
+const samePlace = (a, b) => !!a && !!b && haversine(a, b) < 25;
+const savedFor = (place) => state.saved.find((s) => samePlace(s, place));
+const savedKind = (kind) => state.saved.find((s) => s.kind === kind);
+const favs = () => state.saved.filter((s) => s.kind === 'fav');
+const savedPlace = (s) => ({ lat: s.lat, lon: s.lon, label: s.label, sub: s.sub });
+
+function renderChips() {
+  const chip = (k, icon, label, unset) => `<button class="chip${unset ? ' unset' : ''}" data-k="${k}">${icon}${esc(label)}</button>`;
+  const home = savedKind('home'), work = savedKind('work');
+  $('chips').innerHTML = chip('home', HOME_SVG, home ? 'Home' : 'Set Home', !home) + chip('work', WORK_SVG, work ? 'Work' : 'Set Work', !work)
+    + favs().map((f, i) => chip(`fav${i}`, STAR_SVG, f.name, false)).join('');
+  updateSaveBtn();
+}
+
+$('chips').addEventListener('click', (e) => {
+  const k = e.target.closest('.chip')?.dataset.k;
+  if (!k) return;
+  const s = k.startsWith('fav') ? favs()[+k.slice(3)] : savedKind(k);
+  if (s) { setTo(savedPlace(s)); return; }
+  // "Set Home" / "Set Work": the next destination picked gets saved under that name
+  state.savingAs = k;
+  const to = $('to');
+  to.value = '';
+  to.placeholder = `Search your ${k} address`;
+  to.focus();
+});
+
+function saveAs(kind, place, name) {
+  state.saved = state.saved.filter((s) => !(kind !== 'fav' && s.kind === kind) && !samePlace(s, place));
+  state.saved.push({ kind, name: name ?? (kind === 'home' ? 'Home' : kind === 'work' ? 'Work' : place.label),
+    lat: place.lat, lon: place.lon, label: place.label, sub: place.sub ?? '' });
+  storeSaved();
+  renderChips();
+}
+
+function updateSaveBtn() {
+  const b = $('save-btn'), s = state.to && savedFor(state.to);
+  b.hidden = !state.to;
+  b.classList.toggle('saved', !!s);
+  b.title = s ? `Saved as ${s.name}` : 'Save this place';
+}
+
+$('save-btn').addEventListener('click', () => {
+  if (!state.to) return;
+  activeInput = 'to';
+  const s = savedFor(state.to), items = [];
+  if (s) items.push({ label: `Remove “${s.name}” from saved`, act: 'unsave' });
+  if (s?.kind !== 'home') items.push({ label: 'Save as Home', act: 'home' });
+  if (s?.kind !== 'work') items.push({ label: 'Save as Work', act: 'work' });
+  if (s?.kind !== 'fav') items.push({ label: 'Save as favourite…', sub: 'Becomes a button under the search', act: 'fav' });
+  renderSuggest([{ title: state.to.label, items }]);
+});
+
+function savedAction(act) {
+  const place = state.to;
+  closeSuggest();
+  if (!place) return;
+  if (act === 'unsave') { state.saved = state.saved.filter((s) => !samePlace(s, place)); storeSaved(); renderChips(); return; }
+  if (act !== 'fav') { saveAs(act, place); return; }
+  const name = window.prompt('Name for this place', place.label.slice(0, 24));
+  if (name !== null) saveAs('fav', place, name.trim() || place.label);
+}
+
+state.saved = loadSaved();
+renderChips();
+
 // ---------- start / destination ----------
 
 function setTo(place, remember = true) {
   state.to = place;
+  if (state.savingAs) {
+    saveAs(state.savingAs, place);
+    state.savingAs = null;
+    $('to').placeholder = 'Where to?';
+  }
+  updateSaveBtn();
   $('to').value = place.label;
   if (remember && place.label !== 'Dropped pin') saveRecent(place);
   closeSuggest();
@@ -769,6 +926,7 @@ $('swap').addEventListener('click', () => {
   $('from').value = state.from?.label ?? '';
   $('from-gps').classList.toggle('on', !state.from);
   updatePill();
+  updateSaveBtn();
   drawPlaceMarkers();
   plan();
 });
@@ -877,6 +1035,7 @@ function renderSuggest(groups) {
 function closeSuggest() { $('suggest').hidden = true; suggestions = []; }
 
 function pick(item) {
+  if (item.act) { savedAction(item.act); return; }
   if (item.more) { searchMore(item.q); return; }
   if (activeInput === 'from') setFrom(item.gps ? null : item);
   else setTo(item);
@@ -889,7 +1048,9 @@ function onInput(which) {
   clearTimeout(debounce);
   const gpsItem = which === 'from' ? [{ label: 'My location', sub: 'Use GPS', gps: true }] : [];
   if (q.length < 2) {
-    renderSuggest([{ items: gpsItem }, { title: 'Recent', items: which === 'to' ? loadRecent() : [] }]);
+    const saved = state.saved.map((s) => ({ ...savedPlace(s), label: s.name, sub: s.label === s.name ? s.sub : s.label }));
+    renderSuggest([{ items: gpsItem }, { title: state.savingAs ? `Set ${state.savingAs}` : 'Saved', items: state.savingAs ? [] : saved },
+      { title: 'Recent', items: which === 'to' ? loadRecent() : [] }]);
     return;
   }
   const seq = ++suggestSeq;
@@ -933,6 +1094,7 @@ for (const which of ['from', 'to']) {
   inp.addEventListener('blur', () => setTimeout(() => {
     if (document.activeElement?.closest?.('#panel')) return;
     closeSuggest();
+    if (which === 'to' && state.savingAs) { state.savingAs = null; inp.placeholder = 'Where to?'; }
     // restore the chosen value if the user typed and walked away
     if (which === 'to') inp.value = state.to?.label ?? '';
     else inp.value = state.from?.label ?? '';
@@ -957,22 +1119,30 @@ function saveRecent(place) {
 
 // ---------- location ----------
 
+let plannedAt = null; // GPS position the current plan started from
+
 function onPos(p) {
   const first = !state.gps;
-  state.gps = { lat: p.coords.latitude, lon: p.coords.longitude };
+  state.gps = { lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy };
   state.gpsError = null;
   if (!meMarker) meMarker = new maplibregl.Marker({ element: el('me') }).setLngLat([state.gps.lon, state.gps.lat]).addTo(map);
   else meMarker.setLngLat([state.gps.lon, state.gps.lat]);
   if (first && !state.from) {
     if (state.to || state.mode === 'need') plan(); // need a bike: show the nearest ones right away
     else map.easeTo({ center: [state.gps.lon, state.gps.lat], zoom: 14.5 });
+  } else if (!state.from && plannedAt?.rough && p.coords.accuracy < 100 && haversine(plannedAt, state.gps) > 75) {
+    plan(); // the quick first fix was rough and the precise one is somewhere else: plan again once
   }
+  checkArrival();
 }
 
 if (navigator.geolocation) {
+  // The phone's last known position comes back instantly; the precise fix follows from watchPosition.
+  navigator.geolocation.getCurrentPosition((p) => { if (!state.gps) onPos(p); }, () => {},
+    { enableHighAccuracy: false, maximumAge: 10 * 60e3, timeout: 4000 });
   navigator.geolocation.watchPosition(onPos, (e) => {
     state.gpsError = e.message || 'denied';
-    if (!state.from) plan();
+    if (!state.from && !state.gps) plan();
   }, { enableHighAccuracy: true, maximumAge: 15000 });
 } else {
   state.gpsError = 'unsupported';
@@ -980,16 +1150,82 @@ if (navigator.geolocation) {
 $('from-gps').classList.add('on');
 updatePill();
 
+// ---------- arriving at the bike / the drop-off ----------
+// Walking into the pickup or riding into the drop-off zone zooms the map onto that zone, once per target.
+// A target only fires when it was more than ARRIVE_M away when the option was chosen (planning next to a
+// station must not jump the map straight away).
+
+function startArrivalWatch(r) {
+  const here = state.from ?? state.gps;
+  const targets = [];
+  if (r?.p) targets.push({ role: 'pick', at: r.p });
+  if (r?.s && state.kind !== 'pickup') targets.push({ role: 'drop', at: r.s, r });
+  state.arrival = { targets: targets.filter((t) => !here || haversine(here, t.at) > ARRIVE_M + 30), done: new Set(), pickedUp: false };
+}
+
+function checkArrival() {
+  const A = state.arrival, me = state.gps;
+  if (!A || !me || state.from) return; // only follows you when planning from GPS
+  for (const t of A.targets) {
+    if (A.done.has(t.role) || haversine(me, t.at) > ARRIVE_M) continue;
+    A.done.add(t.role);
+    if (t.role === 'pick') A.pickedUp = true;
+    setPanel(true);
+    setSheet('peek');
+    zoomToZone(t.at);
+    if (t.role === 'pick') {
+      const rent = t.at.uri ? ` ${link(t.at.uri, 'Rent in app')}` : '';
+      showAlert('arrive', 'good', `<b>You're at ${esc(t.at.name)}.</b> ${esc(availText(t.at))} in the green zone.${rent}`);
+    } else {
+      const walk = state.to ? ` ${link(mapsLink(t.at, state.to, 'walking'), `Walk ${min(t.r.walk.time)} min`)}` : '';
+      showAlert('arrive', 'info', `<b>Park inside the blue zone</b> at ${esc(t.at.name)}, then end the rental.${walk}`);
+    }
+    return;
+  }
+}
+
+// ---------- is the bike still there? ----------
+// While a pickup is on screen: fresh counts every 30 s and when the app comes back to the foreground.
+
+async function checkPickup() {
+  if (!['pickup', 'trip'].includes(state.kind) || document.visibilityState !== 'visible') return;
+  if (state.arrival?.pickedUp) return; // you're at the bike (and may have just taken the last one)
+  await refreshStatus(CHECK_EVERY_MS - 5000);
+  const r = state.ranked[state.sel];
+  if (!r?.p) return;
+  const p = r.p.loose ? state.looseById.get(r.p.key) : r.p;
+  const left = p ? avail(p) : 0;
+  if (left > 0) { hideAlert('bike'); renderResults(true); return; }
+  renderResults(true);
+  showAlert('bike', 'warn', `<b>${r.p.loose ? 'That bike' : `The last ${typeWord().replace(/s$/, '')} at ${esc(r.p.name)}`} was just taken.</b> `
+    + '<button class="alert-btn" data-act="replan">Find the next best</button>');
+}
+setInterval(checkPickup, CHECK_EVERY_MS);
+document.addEventListener('visibilitychange', checkPickup);
+
 // ---------- stations + bikes ----------
 
 const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
 const rentUri = (u) => (u ? (IOS ? u.ios : u.android) ?? u.web : null);
 
-// Counts per type come from station_status; battery levels and loose bikes from free_bike_status.
-function applyStatus(status, free) {
+// Live counts per type (station_status, ~5 KB): needed before anything can be planned.
+function applyCounts(status) {
   const st = new Map(status.data.stations.map((s) => [s.station_id, s]));
+  for (const s of state.stations) {
+    const x = st.get(s.id) ?? {};
+    s.n = { bike: 0, ebike: 0 };
+    for (const t of x.vehicle_types_available ?? []) s.n[state.vehicleKind[t.vehicle_type_id] ?? 'bike'] += t.count;
+    s.renting = x.is_renting !== false && x.is_installed !== false;
+    s.returning = x.is_returning !== false && x.is_installed !== false;
+  }
+  state.statusAt = Date.now();
+}
+
+// Individual bikes (free_bike_status, ~120 KB): e-bike battery per station and bikes parked outside stations.
+function applyBikes(free) {
   const best = new Map(); // station_id -> best e-bike battery %
   state.loose = [];
+  state.looseById = new Map();
   for (const b of free.data.bikes) {
     if (b.is_reserved || b.is_disabled) continue;
     const kind = state.vehicleKind[b.vehicle_type_id] ?? 'bike';
@@ -997,41 +1233,45 @@ function applyStatus(status, free) {
     if (b.station_id) {
       if (kind === 'ebike' && battery != null) best.set(b.station_id, Math.max(best.get(b.station_id) ?? 0, battery));
     } else {
-      state.loose.push({
-        key: `l${state.loose.length}`, loose: true, lat: b.lat, lon: b.lon, battery: kind === 'ebike' ? battery : null,
+      const bike = {
+        key: `l:${b.bike_id}`, loose: true, lat: b.lat, lon: b.lon, battery: kind === 'ebike' ? battery : null,
         name: kind === 'ebike' ? 'Loose e-bike' : 'Loose bike', n: { bike: +(kind === 'bike'), ebike: +(kind === 'ebike') }, uri: rentUri(b.rental_uris),
-      });
+      };
+      state.loose.push(bike);
+      state.looseById.set(bike.key, bike);
     }
   }
-  for (const s of state.stations) {
-    const x = st.get(s.id) ?? {};
-    s.n = { bike: 0, ebike: 0 };
-    for (const t of x.vehicle_types_available ?? []) s.n[state.vehicleKind[t.vehicle_type_id] ?? 'bike'] += t.count;
-    s.battery = best.get(s.id) ?? null;
-    s.renting = x.is_renting !== false && x.is_installed !== false;
-    s.returning = x.is_returning !== false && x.is_installed !== false;
-  }
-  state.statusAt = Date.now();
+  for (const s of state.stations) s.battery = best.get(s.id) ?? null;
 }
 
-async function loadStations() {
-  const [info, status, free, types] = await Promise.all([
-    getJSON(`${GBFS}/station_information.json`), getJSON(`${GBFS}/station_status.json`),
-    getJSON(`${GBFS}/free_bike_status.json`), getJSON(`${GBFS}/vehicle_types.json`).catch(() => null),
-  ]);
-  state.vehicleKind = { 348: 'ebike' };
-  for (const t of types?.data?.vehicle_types ?? []) state.vehicleKind[t.vehicle_type_id] = t.propulsion_type === 'human' ? 'bike' : 'ebike';
-  state.stations = info.data.stations.map((s, i) => ({
-    i, key: `s${i}`, id: s.station_id, name: s.name, lat: s.lat, lon: s.lon, area: s.station_area, uri: rentUri(s.rental_uris),
-  }));
-  applyStatus(status, free);
+// Station list + zones (~100 KB) rarely change: kept on the phone, refreshed in the background
+// for the next launch, so a normal start only waits for the 5 KB of live counts.
+async function fetchInfo() {
+  const [info, types] = await Promise.all([getJSON(`${GBFS}/station_information.json`), getJSON(`${GBFS}/vehicle_types.json`).catch(() => null)]);
+  const vehicleKind = { 348: 'ebike' };
+  for (const t of types?.data?.vehicle_types ?? []) vehicleKind[t.vehicle_type_id] = t.propulsion_type === 'human' ? 'bike' : 'ebike';
+  const c = {
+    at: Date.now(), vehicleKind,
+    stations: info.data.stations.map((s) => ({ id: s.station_id, name: s.name, lat: s.lat, lon: s.lon, area: s.station_area, uri: rentUri(s.rental_uris) })),
+  };
+  try { localStorage.setItem(INFO_KEY, JSON.stringify(c)); } catch { /* storage full / private mode: just refetch next time */ }
+  return c;
+}
+function cachedInfo() {
+  try { const c = JSON.parse(localStorage.getItem(INFO_KEY)); return c?.stations?.length ? c : null; } catch { return null; }
+}
+function useInfo(c) {
+  state.vehicleKind = c.vehicleKind;
+  state.stations = c.stations.map((s, i) => ({ ...s, i, key: `s${i}`, n: { bike: 0, ebike: 0 }, battery: null, renting: true, returning: true }));
 }
 
-async function refreshStatus() {
-  if (Date.now() - state.statusAt < STATUS_TTL_MS) return;
+let bikesP = null;
+async function refreshStatus(maxAge = STATUS_TTL_MS) {
+  if (Date.now() - state.statusAt < maxAge) return;
   try {
     const [status, free] = await Promise.all([getJSON(`${GBFS}/station_status.json`), getJSON(`${GBFS}/free_bike_status.json`)]);
-    applyStatus(status, free);
+    applyCounts(status);
+    applyBikes(free);
     setStationsOnMap();
   } catch (e) { console.warn('status refresh', e); }
 }
@@ -1043,11 +1283,24 @@ new ResizeObserver(([e]) => requestAnimationFrame(() => {
 
 (async () => {
   try {
-    await Promise.all([loadStations(), mapReady]);
-    setStationsOnMap();
+    const statusP = getJSON(`${GBFS}/station_status.json`);
+    bikesP = getJSON(`${GBFS}/free_bike_status.json`);
+    const cached = cachedInfo();
+    if (cached && Date.now() - cached.at > INFO_TTL_MS) fetchInfo().catch((e) => console.warn('station list refresh', e));
+    useInfo(cached ?? await fetchInfo());
+    applyCounts(await statusP);
+    state.statusAt = 0; // counts are fresh, but the individual bikes are still loading
     const n = state.stations.reduce((a, s) => ({ bike: a.bike + s.n.bike, ebike: a.ebike + s.n.ebike }), { bike: 0, ebike: 0 });
     hint(`${state.stations.length} stations · ${n.bike.toLocaleString('de')} bikes · ${n.ebike.toLocaleString('de')} e-bikes`);
+    setStationsOnMap();
     plan();
+    // Battery levels and loose bikes fill in a moment later, without re-planning.
+    bikesP.then((free) => {
+      applyBikes(free);
+      state.statusAt = Date.now();
+      setStationsOnMap();
+      if (state.ranked.length) renderResults(true);
+    }).catch((e) => console.warn('bikes', e));
   } catch (e) {
     console.error(e);
     hint('Could not load MyRadl stations. Check your connection and reload.', true);

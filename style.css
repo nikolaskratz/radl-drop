@@ -56,6 +56,25 @@ button { font: inherit; color: inherit; }
 .panel.compact .panel-body { display: none; }
 .panel { transition: box-shadow .2s; }
 
+/* saved places: one tap = plan there */
+.chips { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; padding: 6px 4px; border-top: 1px solid var(--line); }
+.chips::-webkit-scrollbar { display: none; }
+.chip { flex: none; display: inline-flex; align-items: center; gap: 6px; border: 1.5px solid var(--line); background: var(--surface); color: var(--text);
+  border-radius: 999px; padding: 5px 11px; font-size: 14px; font-weight: 600; cursor: pointer; white-space: nowrap; max-width: 60%; overflow: hidden; text-overflow: ellipsis; }
+.chip svg { flex: none; color: var(--accent); }
+.chip.unset { border-style: dashed; color: var(--muted); font-weight: 500; }
+.chip.unset svg { color: var(--muted); }
+#save-btn.saved { color: var(--warn); --star-fill: var(--warn); }
+
+/* banner in the sheet: bike taken / arrived */
+.alert { display: flex; align-items: flex-start; gap: 8px; border-radius: 12px; padding: 10px 6px 10px 12px; margin: 0 0 8px; font-size: 14.5px; }
+.alert.warn { background: color-mix(in srgb, var(--warn) 16%, var(--surface)); }
+.alert.good { background: color-mix(in srgb, var(--good) 15%, var(--surface)); }
+.alert.info { background: color-mix(in srgb, var(--accent) 13%, var(--surface)); }
+.alert-body { flex: 1; min-width: 0; }
+.alert a, .alert-btn { color: var(--accent); font-weight: 650; text-decoration: none; border: 0; background: none; padding: 0; cursor: pointer; font-size: inherit; }
+.alert-x { flex: none; border: 0; background: none; color: var(--muted); font-size: 20px; line-height: 1; padding: 0 6px; cursor: pointer; }
+
 .modes { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; padding: 6px 4px 2px; border-top: 1px solid var(--line); }
 .seg { display: flex; background: color-mix(in srgb, var(--muted) 12%, transparent); border-radius: 10px; padding: 2px; }
 .seg button { border: 0; background: transparent; cursor: pointer; font-size: 13.5px; font-weight: 600; color: var(--muted); padding: 6px 10px; border-radius: 8px; white-space: nowrap; }
