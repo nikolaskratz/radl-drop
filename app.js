@@ -306,6 +306,7 @@ function clearResults() {
   state.ranked = [];
   state.kind = null;
   $('results').innerHTML = '';
+  $('pager').innerHTML = '';
   setMapCandidates();
   setRoute([]);
   drawRankMarkers();
@@ -372,7 +373,9 @@ function renderResults() {
   }
   hint(msg);
   const S = startPoint();
+  setSheet('peek');
   $('results').innerHTML = state.ranked.slice(0, 3).map((r, i) => cardHTML(r, i, S)).join('');
+  $('results').scrollLeft = 0;
   $('replan').hidden = false;
   $('replan').textContent = state.from ? 'Plan from my location' : 'Re-plan from here';
   setMapCandidates();
@@ -385,9 +388,12 @@ function legsOf(r) {
   return [[S, r.p, 'walk'], [r.p, r.s, ride], [r.s, D, 'walk']];
 }
 
-async function select(i, fit = false) {
+async function select(i, fit = false, fromSwipe = false) {
   state.sel = i;
   document.querySelectorAll('.card').forEach((c) => c.classList.toggle('sel', +c.dataset.i === i));
+  if (!fromSwipe) scrollToCard(i, !fit);
+  const n = Math.min(3, state.ranked.length);
+  $('pager').innerHTML = n > 1 ? Array.from({ length: n }, (_, k) => `<i${k === i ? ' class="on"' : ''}></i>`).join('') : '';
   drawRankMarkers();
   const legs = legsOf(state.ranked[i]);
   const ends = legs.flatMap(([a, b]) => [a, b]);
@@ -418,6 +424,7 @@ for (const [id, key] of [['mode', 'mode'], ['type', 'type']]) {
     state[key] = v;
     savePrefs();
     setSeg(id, v);
+    updatePill();
     setStationsOnMap();
     plan();
   });
@@ -608,6 +615,90 @@ map.on('touchmove', (e) => { if (lp && (Math.abs(e.point.x - lp.p.x) > 10 || Mat
 for (const ev of ['touchend', 'touchcancel', 'zoomstart']) map.on(ev, () => clearTimeout(lp?.t));
 map.on('contextmenu', (e) => pointMenu(e.lngLat));
 
+// ---------- panel + sheet: get out of the map's way ----------
+// The search panel collapses to a one-line summary once a destination is set or the map is dragged;
+// the results sheet "peeks" as a sideways-swipe row of cards and expands to the full list on demand.
+
+function updatePill() {
+  const S = startPoint();
+  $('pill-to').textContent = state.to?.label ?? 'Where to?';
+  $('pill-sub').textContent = [`From ${S?.label ?? state.from?.label ?? 'my location'}`,
+    state.mode === 'need' ? 'Need a bike' : 'On a bike', { any: 'All bikes', bike: 'Normal bikes', ebike: 'E-bikes' }[state.type]].join(' · ');
+}
+
+function setPanel(compact) {
+  if (compact) updatePill();
+  $('panel').classList.toggle('compact', compact);
+  $('pill').setAttribute('aria-expanded', String(!compact));
+}
+
+$('pill').addEventListener('click', () => {
+  setPanel(false);
+  if (!state.to) $('to').focus();
+});
+
+const sheetFull = () => $('sheet').classList.contains('full');
+function setSheet(mode) {
+  const full = mode === 'full';
+  if (full === sheetFull()) return;
+  $('sheet').classList.toggle('full', full);
+  $('grabber').setAttribute('aria-expanded', String(full));
+  $('grabber').setAttribute('aria-label', full ? 'Show less' : 'Show details');
+  $('sheet').scrollTop = 0;
+  if (!full) requestAnimationFrame(() => scrollToCard(state.sel, false));
+}
+$('grabber').addEventListener('click', () => setSheet(sheetFull() ? 'peek' : 'full'));
+
+// Vertical swipe on the sheet: up = details, down (from the top of the list) = back to the card row.
+let swipe = null;
+$('sheet').addEventListener('touchstart', (e) => {
+  const t = e.touches[0];
+  swipe = e.touches.length === 1 ? { x: t.clientX, y: t.clientY, top: $('sheet').scrollTop } : null;
+}, { passive: true });
+$('sheet').addEventListener('touchend', (e) => {
+  if (!swipe || !state.ranked.length) return;
+  const t = e.changedTouches[0], dx = t.clientX - swipe.x, dy = t.clientY - swipe.y, top = swipe.top;
+  swipe = null;
+  if (Math.abs(dy) < 40 || Math.abs(dy) < 1.5 * Math.abs(dx)) return;
+  if (dy < 0 && !sheetFull()) setSheet('full');
+  else if (dy > 0 && sheetFull() && top <= 0) setSheet('peek');
+}, { passive: true });
+
+// Card row: the card that snaps into the middle becomes the selected option (and its route is drawn).
+let swipeTimer = null, programmaticUntil = 0;
+$('results').addEventListener('scroll', () => {
+  if (sheetFull()) return;
+  clearTimeout(swipeTimer);
+  swipeTimer = setTimeout(() => {
+    if (Date.now() < programmaticUntil) return;
+    const list = $('results'), mid = list.getBoundingClientRect().left + list.clientWidth / 2;
+    let best = state.sel, bestD = Infinity;
+    [...list.children].forEach((c, i) => {
+      const r = c.getBoundingClientRect(), d = Math.abs(r.left + r.width / 2 - mid);
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    if (best !== state.sel) select(best, false, true);
+  }, 120);
+}, { passive: true });
+
+function scrollToCard(i, smooth = true) {
+  if (sheetFull()) return;
+  const list = $('results'), card = list.children[i];
+  if (!card) return;
+  const lr = list.getBoundingClientRect(), cr = card.getBoundingClientRect();
+  const left = list.scrollLeft + (cr.left - lr.left) - (lr.width - cr.width) / 2;
+  programmaticUntil = Date.now() + 700;
+  list.scrollTo({ left, behavior: smooth ? 'smooth' : 'auto' });
+}
+
+// Touching the map means "I want to look": fold both away.
+map.on('dragstart', () => {
+  if ($('panel').contains(document.activeElement)) document.activeElement.blur();
+  closeSuggest();
+  setPanel(true);
+  setSheet('peek');
+});
+
 // ---------- start / destination ----------
 
 function setTo(place, remember = true) {
@@ -615,6 +706,8 @@ function setTo(place, remember = true) {
   $('to').value = place.label;
   if (remember && place.label !== 'Dropped pin') saveRecent(place);
   closeSuggest();
+  document.activeElement?.blur();
+  setPanel(true); // destination chosen: give the map the room
   drawPlaceMarkers();
   plan();
 }
@@ -624,6 +717,7 @@ function setFrom(place) {
   $('from').value = place ? place.label : '';
   $('from-gps').classList.toggle('on', !place);
   closeSuggest();
+  if (state.to) { document.activeElement?.blur(); setPanel(true); } else updatePill();
   drawPlaceMarkers();
   plan();
 }
@@ -638,6 +732,7 @@ $('swap').addEventListener('click', () => {
   $('to').value = state.to?.label ?? '';
   $('from').value = state.from?.label ?? '';
   $('from-gps').classList.toggle('on', !state.from);
+  updatePill();
   drawPlaceMarkers();
   plan();
 });
@@ -847,6 +942,7 @@ if (navigator.geolocation) {
   state.gpsError = 'unsupported';
 }
 $('from-gps').classList.add('on');
+updatePill();
 
 // ---------- stations + bikes ----------
 

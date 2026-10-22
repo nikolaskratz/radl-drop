@@ -45,6 +45,16 @@ button { font: inherit; color: inherit; }
 .icon-btn { flex: none; width: 40px; height: 40px; border: 0; background: transparent; border-radius: 10px; color: var(--muted); display: grid; place-items: center; cursor: pointer; }
 .icon-btn:active, .icon-btn.on { color: var(--accent); }
 
+/* collapsed panel: one tappable summary row */
+.pill { display: none; width: 100%; align-items: center; gap: 10px; border: 0; background: transparent; cursor: pointer;
+  text-align: left; padding: 6px 8px 6px 12px; color: var(--muted); }
+.pill-text { flex: 1; min-width: 0; display: grid; }
+.pill-to { color: var(--text); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pill-sub { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.panel.compact .pill { display: flex; }
+.panel.compact .panel-body { display: none; }
+.panel { transition: box-shadow .2s; }
+
 .modes { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; padding: 6px 4px 2px; border-top: 1px solid var(--line); }
 .seg { display: flex; background: color-mix(in srgb, var(--muted) 12%, transparent); border-radius: 10px; padding: 2px; }
 .seg button { border: 0; background: transparent; cursor: pointer; font-size: 13.5px; font-weight: 600; color: var(--muted); padding: 6px 10px; border-radius: 8px; white-space: nowrap; }
@@ -59,16 +69,24 @@ button { font: inherit; color: inherit; }
 
 .sheet { position: fixed; z-index: 2; left: 0; right: 0; bottom: 0; max-width: 520px; margin: 0 auto;
   background: var(--surface); border-radius: var(--radius) var(--radius) 0 0; box-shadow: var(--shadow);
-  padding: 14px 16px calc(env(safe-area-inset-bottom) + 14px); max-height: 46vh; overflow-y: auto; }
+  padding: 0 16px calc(env(safe-area-inset-bottom) + 12px); max-height: 64vh; overflow-y: auto; overscroll-behavior: contain; }
+.grabber { display: grid; place-items: center; width: calc(100% + 32px); height: 22px; margin: 0 -16px; border: 0; background: none;
+  cursor: pointer; touch-action: none; position: sticky; top: 0; background: var(--surface); z-index: 1; }
+.grabber span { width: 40px; height: 5px; border-radius: 3px; background: var(--line); }
+.sheet:has(.results:empty) .grabber { visibility: hidden; height: 12px; }
 [hidden] { display: none !important; }
 .sheet-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .sheet-head:has(.hint:empty):has(.link-btn[hidden]) { display: none; }
 .hint { color: var(--muted); font-size: 15px; }
+.pager { display: flex; gap: 5px; margin-right: auto; }
+.pager i { width: 6px; height: 6px; border-radius: 50%; background: var(--line); }
+.pager i.on { background: var(--accent); }
+.sheet.full .pager { display: none; }
 .link-btn { flex: none; border: 0; background: none; cursor: pointer; color: var(--accent); font-weight: 600; font-size: 14px; padding: 4px 0; }
 .hint.err { color: var(--to); }
 .results { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
 .results:empty { display: none; }
-.sheet-head + .results:not(:empty) { margin-top: 10px; }
+.sheet-head + .results:not(:empty) { margin-top: 8px; }
 
 .card { border: 1.5px solid var(--line); border-radius: 14px; padding: 12px; cursor: pointer; }
 .card.sel { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 6%, transparent); }
@@ -103,6 +121,20 @@ button { font: inherit; color: inherit; }
 .card:not(.sel) .total { font-size: 20px; }
 .card:not(.sel) .rank { width: 24px; height: 24px; font-size: 13px; }
 
+
+/* peek (default): one row of cards, swipe sideways between options */
+.sheet:not(.full) { touch-action: pan-x; }
+.sheet:not(.full) .hint { font-size: 14px; }
+.sheet:not(.full) .results { display: flex; gap: 10px; overflow-x: auto; scroll-snap-type: x mandatory; margin-left: -16px; margin-right: -16px;
+  padding: 0 16px; scroll-padding: 0 16px; scrollbar-width: none; }
+.sheet:not(.full) .results::-webkit-scrollbar { display: none; }
+.sheet:not(.full) .card { flex: 0 0 calc(100% - 28px); scroll-snap-align: center; padding: 10px 12px; }
+.sheet:not(.full) .card:only-child { flex-basis: 100%; }
+.sheet:not(.full) .card .actions { display: flex; margin-top: 8px; }
+.sheet:not(.full) .card .total { font-size: 24px; }
+.sheet:not(.full) .card .rank { width: 28px; height: 28px; font-size: 15px; }
+.sheet:not(.full) .steps, .sheet:not(.full) .badges { display: none; }
+.sheet:not(.full) .card:not(.sel) { border-color: var(--line); background: transparent; }
 
 /* map markers */
 .pin-wrap { cursor: pointer; }

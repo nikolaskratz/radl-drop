@@ -19,6 +19,12 @@
   <div id="map" aria-label="Map"></div>
 
   <header class="panel" id="panel">
+    <button class="pill" id="pill" type="button" aria-label="Edit trip" aria-controls="panel-body">
+      <span class="dot dot-to" aria-hidden="true"></span>
+      <span class="pill-text"><span class="pill-to" id="pill-to">Where to?</span><span class="pill-sub" id="pill-sub"></span></span>
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <div class="panel-body" id="panel-body">
     <div class="field">
       <span class="dot dot-from" aria-hidden="true"></span>
       <input id="from" type="search" autocomplete="off" placeholder="My location" aria-label="Start">
@@ -45,11 +51,14 @@
       </div>
     </div>
     <ul class="suggest" id="suggest" role="listbox" hidden></ul>
+    </div>
   </header>
 
   <section class="sheet" id="sheet" aria-live="polite">
+    <button class="grabber" id="grabber" type="button" aria-label="Show details" aria-expanded="false"><span></span></button>
     <div class="sheet-head">
       <div class="hint" id="hint">Loading stations…</div>
+      <div class="pager" id="pager" aria-hidden="true"></div>
       <button class="link-btn" id="replan" hidden>Re-plan from here</button>
     </div>
     <ol class="results" id="results"></ol>
