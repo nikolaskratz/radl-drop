@@ -375,7 +375,7 @@ function renderResults() {
   const S = startPoint();
   setSheet('peek');
   $('results').innerHTML = state.ranked.slice(0, 3).map((r, i) => cardHTML(r, i, S)).join('');
-  $('results').scrollLeft = 0;
+  scrollToCard(0, false);
   $('replan').hidden = false;
   $('replan').textContent = state.from ? 'Plan from my location' : 'Re-plan from here';
   setMapCandidates();
@@ -664,32 +664,68 @@ $('sheet').addEventListener('touchend', (e) => {
   else if (dy > 0 && sheetFull() && top <= 0) setSheet('peek');
 }, { passive: true });
 
-// Card row: the card that snaps into the middle becomes the selected option (and its route is drawn).
-let swipeTimer = null, programmaticUntil = 0;
-$('results').addEventListener('scroll', () => {
-  if (sheetFull()) return;
-  clearTimeout(swipeTimer);
-  swipeTimer = setTimeout(() => {
-    if (Date.now() < programmaticUntil) return;
-    const list = $('results'), mid = list.getBoundingClientRect().left + list.clientWidth / 2;
-    let best = state.sel, bestD = Infinity;
-    [...list.children].forEach((c, i) => {
-      const r = c.getBoundingClientRect(), d = Math.abs(r.left + r.width / 2 - mid);
-      if (d < bestD) { bestD = d; best = i; }
-    });
-    if (best !== state.sel) select(best, false, true);
-  }, 120);
-}, { passive: true });
+// Card row (peek): own swipe handling instead of CSS scroll-snap, which behaves differently on iOS.
+// The row follows the finger; a drag past 50 px or a quick flick moves exactly one card.
+// Cards are shifted with a transform driven by --idx (selected card) and --drag (finger offset).
+const row = $('results');
+let drag = null, suppressClick = false;
 
 function scrollToCard(i, smooth = true) {
-  if (sheetFull()) return;
-  const list = $('results'), card = list.children[i];
-  if (!card) return;
-  const lr = list.getBoundingClientRect(), cr = card.getBoundingClientRect();
-  const left = list.scrollLeft + (cr.left - lr.left) - (lr.width - cr.width) / 2;
-  programmaticUntil = Date.now() + 700;
-  list.scrollTo({ left, behavior: smooth ? 'smooth' : 'auto' });
+  row.classList.toggle('instant', !smooth);
+  row.style.setProperty('--idx', i);
+  row.style.setProperty('--drag', '0px');
 }
+
+row.addEventListener('pointerdown', (e) => {
+  if (sheetFull() || row.children.length < 2 || (e.pointerType === 'mouse' && e.button !== 0)) return;
+  drag = { id: e.pointerId, x: e.clientX, y: e.clientY, dx: 0, axis: null, trail: [{ t: e.timeStamp, x: e.clientX }] };
+});
+row.addEventListener('pointermove', (e) => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.trail.push({ t: e.timeStamp, x: e.clientX });
+  while (drag.trail.length > 2 && e.timeStamp - drag.trail[0].t > 100) drag.trail.shift(); // last ~100 ms
+  if (!drag.axis && Math.hypot(dx, dy) > 8) {
+    drag.axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
+    if (drag.axis === 'x') { row.setPointerCapture(e.pointerId); row.classList.add('dragging'); }
+  }
+  if (drag.axis !== 'x') return;
+  const atEdge = (state.sel === 0 && dx > 0) || (state.sel === row.children.length - 1 && dx < 0);
+  drag.dx = atEdge ? dx * 0.3 : dx; // rubber band past the first / last card
+  row.style.setProperty('--drag', `${drag.dx}px`);
+});
+function endDrag(e) {
+  if (!drag || e.pointerId !== drag.id) return;
+  const d = drag;
+  drag = null;
+  if (d.axis !== 'x') return;
+  row.classList.remove('dragging');
+  suppressClick = true; // the click that follows a drag must not open a link or select a card
+  setTimeout(() => { suppressClick = false; }, 50);
+  // flick speed over the last ~100 ms up to the lift-off, px per ms (holding still before lifting = no flick)
+  d.trail.push({ t: e.timeStamp, x: e.clientX });
+  while (d.trail.length > 2 && e.timeStamp - d.trail[0].t > 100) d.trail.shift();
+  const first = d.trail[0], last = d.trail[d.trail.length - 1];
+  const v = (last.x - first.x) / Math.max(16, last.t - first.t);
+  const n = row.children.length;
+  let i = state.sel;
+  const flick = Math.abs(d.dx) > 15 && Math.abs(v) > 0.3;
+  if (d.dx < -50 || (flick && v < 0)) i = Math.min(n - 1, i + 1);
+  else if (d.dx > 50 || (flick && v > 0)) i = Math.max(0, i - 1);
+  scrollToCard(i);
+  if (i !== state.sel) select(i, false, true);
+}
+// The row is overflow: hidden, but focus or scrollIntoView can still scroll it natively; positions come from --idx only.
+row.addEventListener('scroll', () => { if (row.scrollLeft) row.scrollLeft = 0; }, { passive: true });
+row.addEventListener('pointerup', endDrag);
+row.addEventListener('pointercancel', endDrag);
+row.addEventListener('click', (e) => {
+  if (suppressClick) { e.preventDefault(); e.stopPropagation(); }
+}, true);
+$('pager').addEventListener('click', (e) => {
+  const dots = [...$('pager').children], k = dots.indexOf(e.target);
+  if (k >= 0 && k !== state.sel) select(k);
+});
 
 // Touching the map means "I want to look": fold both away.
 map.on('dragstart', () => {

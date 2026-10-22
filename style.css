@@ -122,18 +122,20 @@ button { font: inherit; color: inherit; }
 .card:not(.sel) .rank { width: 24px; height: 24px; font-size: 13px; }
 
 
-/* peek (default): one row of cards, swipe sideways between options */
+/* peek (default): one card at a time, swiped sideways (see "Card row" in app.js) */
 .sheet:not(.full) { touch-action: pan-x; }
 .sheet:not(.full) .hint { font-size: 14px; }
-.sheet:not(.full) .results { display: flex; gap: 32px; overflow-x: auto; scroll-snap-type: x mandatory; margin-left: -16px; margin-right: -16px;
-  padding: 0 16px; scroll-padding: 0 16px; scrollbar-width: none; }
-.sheet:not(.full) .results::-webkit-scrollbar { display: none; }
-.sheet:not(.full) .card { flex: 0 0 100%; scroll-snap-align: center; scroll-snap-stop: always; padding: 10px 12px; }
+.sheet:not(.full) .results { display: flex; gap: 32px; overflow: hidden; margin-left: -16px; margin-right: -16px; padding: 0 16px;
+  touch-action: none; -webkit-user-select: none; user-select: none; }
+.sheet:not(.full) .card { flex: 0 0 100%; padding: 10px 12px;
+  transform: translateX(calc(var(--idx, 0) * (-100% - 32px) + var(--drag, 0px))); transition: transform .28s cubic-bezier(.2, .8, .2, 1); }
+.sheet:not(.full) .results.dragging .card, .sheet:not(.full) .results.instant .card { transition: none; }
 .sheet:not(.full) .card .actions { display: flex; margin-top: 8px; }
 .sheet:not(.full) .card .total { font-size: 24px; }
 .sheet:not(.full) .card .rank { width: 28px; height: 28px; font-size: 15px; }
 .sheet:not(.full) .steps, .sheet:not(.full) .badges { display: none; }
 .sheet:not(.full) .card:not(.sel) { border-color: var(--line); background: transparent; }
+.pager i { cursor: pointer; }
 
 /* map markers */
 .pin-wrap { cursor: pointer; }
